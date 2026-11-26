@@ -1,0 +1,10 @@
+---
+title: "2_Hypothesis"
+output: html_document
+date: "2026-11-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
