@@ -1,10 +1,800 @@
 ---
-title: "1_prepocessing_QC_final"
+title: "1_preprocessing_QC"
 output: html_document
-date: "2026-11-26"
+date: "2026-11-25"
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+# Loading the datasets
+
+read olink_batch_id as a text instead of a number. Batch IDs are labels (nominal), and some contain letters, which would otherwise become NA.
+
+```{r load, message=FALSE}
+library(tidyverse)
+
+meta  <- read_csv("data/sample_metadata.csv", 
+                  col_types = cols(olink_batch_id = col_character()))
+npx   <- read_csv("data/proteins_npx_raw.csv")
+annot <- read_csv("data/protein_annotation.csv")
+
+# the samples must be in the same order in both files (otherwise this gives an error)
+stopifnot(identical(meta$sample_kit_id, npx$sample_kit_id))
+```
+
+# Q1: How many samples and features are there, and what is each variable type (nominal, ordinal, continuous, discrete)?
+
+## How many samples and features
+
+```{r q1.1.}
+dim(meta)    # rows = samples, columns = metadata variables
+dim(npx)     # rows = samples, columns = sample ID + proteins
+dim(annot)   # rows = proteins, columns = annotation columns
+```
+- 867 samples, 76 metadata variables, 1,481 proteins (the sample ID is the extra column in the NPX file)
+- The three files fit together: same number of samples, and the order of the samples is identical in `meta` and `npx` (checked with `stopifnot`)
+- NPX values are already on a log2 scale, so no extra log-transformation is needed (see Q4)
+
+```{r q1-donors}
+# the amount of samples and donors
+n_distinct(meta$sample_kit_id)          # unique samples
+n_distinct(meta$subject.subjectGuid)    # unique donors
+
+# number of samples per donor
+meta %>%
+  group_by(subject.subjectGuid) %>%
+  summarise(n_samples = n()) %>%
+  summary()
+
+# donors per age group and sex
+meta %>%
+  group_by(subject.ageGroup, subject.biologicalSex) %>%
+  summarise(n_donors = n_distinct(subject.subjectGuid))
+
+# age range per group
+meta %>%
+  group_by(subject.ageGroup) %>%
+  summarise(min_age = min(sample.subjectAgeAtDraw),
+            max_age = max(sample.subjectAgeAtDraw))
+```
+- 867 samples from 96 donors (mean 9.0 samples per donor, median 10, range 1 to 10). The samples of one donor are repeated measurements and are not independent.
+- Age groups are balanced: 49 young donors (28 female, 21 male) and 47 older donors (27 female, 20 male).
+- Age forms two separate groups: young adults 25 to 37 years and older adults 55 to 67 years. Nobody is between 38 and 54, so age is in practice a two-group variable.
+
+## Variable types
+
+R stores each column as text (chr) or a number (dbl). With `str()` we see the
+R type and the first values of each variable. Based on this and on the meaning
+of each variable, we decide the statistical type.
+
+```{r variable-types}
+str(meta)
+```
+
+
+```{r q1-types}
+var_types <- tibble(
+  variable = names(meta),
+  r_class  = map_chr(meta, ~ class(.x)[1]),
+  n_unique = map_int(meta, n_distinct)
+)
+print(var_types, n = Inf)
+```
+
+Based on this overview, we classify them as follows:
+
+| Type | Variables |
+|---|---|
+| ID (not analysed) | `sample_kit_id`, `subject.subjectGuid` |
+| Nominal | sex, CMV status, race, ethnicity, visit name, cohort, batch, plate |
+| Ordinal | age group (young < older) |
+| Discrete | age (years), days since first visit, draw year, `n_missing_npx` |
+| Continuous | lab values (`chem.*`, `bc.*`, `infl.*`), BMI, height, weight, `pct_below_lod` |
+| Proteins (1,472) | all continuous (NPX values, log2 scale) |
+
+We convert the categorical variables to factors, so R treats them as groups.
+For age group we set the order, so "Young Adult" is the reference group.
+
+```{r q1-factors}
+meta <- meta %>%
+  mutate(subject.ageGroup = factor(subject.ageGroup,
+                                   levels = c("Young Adult", "Older Adult")),
+         subject.biologicalSex = as.factor(subject.biologicalSex),
+         cmv_status = as.factor(cmv_status),
+         olink_batch_id = as.factor(olink_batch_id),
+         cohort.cohortGuid = as.factor(cohort.cohortGuid))
+
+str(meta %>% select(subject.ageGroup, subject.biologicalSex,
+                    cmv_status, olink_batch_id))
+```
+- Categorical variables are converted to factors so R treats them as groups: age group, sex, CMV status, batch and cohort.
+- For age group the order is set explicitly, so "Young Adult" is the reference group in later models.
+- Batch has 6 levels. It was read as text from the start, because some batch IDs contain letters (Q-02017 and Q-04064) and would otherwise become NA.
+
+# Q2 : Where are the missing values, why might they be missing, should missingness be handled and how?
+
+## Missing values in metadata
+
+We count the missing values (NA) per variable and show only the variables
+that have missing values.
+
+```{r q2-meta}
+
+# number of missing values per column
+n_missing <- colSums(is.na(meta))
+
+# put this in a table, as a percentage of all samples
+meta_missing <- tibble(variable    = names(n_missing),
+                       n_missing   = n_missing,
+                       pct_missing = round(n_missing / nrow(meta) * 100, 1)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(pct_missing))
+
+meta_missing
+```
+- Most metadata variables are (almost) complete. 12 variables have the most missing values: CMV serology, anti-CCP and rheumatoid factor (about 89%), eGFR (about 83%), total protein (29%) and BMI (21%).
+- Almost all of these are clinical lab values that are only measured in part of the samples (the reasons are investigated below).
+
+
+```{r q2-meta-plot, fig.height=7}
+ggplot(meta_missing, aes(x = reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(x = NULL, y = "Missing values (% of samples)",
+       title = "Missing values per metadata variable") +
+  theme_classic()
+```
+
+### Why are they missing
+
+In the table a few variables (CMV serology, anti-CCP, rheumatoid factor) are missing in about 89% of samples.
+A hypothesis: maybe they were measured only once per person, not at every blood draw. We check whether it was measured only once per donor.
+
+```{r q2-cmv}
+meta %>%
+  filter(!is.na(cmv.igg_serology)) %>%
+  group_by(subject.subjectGuid) %>%
+  summarise(n_measurements = n()) %>%
+  group_by(n_measurements) %>%
+  summarise(n_donors = n())
+```
+- 92 donors have exactly one CMV serology measurement. CMV serology, anti-CCP and rheumatoid factor were measured once per donor, so the ~89% missingness is by design and not a data problem.
+- The CMV status itself (`cmv_status`) is available for all samples, so we use that variable instead of the serology (see the table in the next section).
+
+
+### How to handle the missingness
+
+| Pattern | Variables | % missing | Reason |
+|---|---|---|---|
+| Measured once per donor | CMV serology, anti-CCP, rheumatoid factor | ~89% | one-off screening test (by design) |
+| Stopped during the study | eGFR | ~83% | reported in 2019 and 2020, missing in 2021 and 2022 |
+| Stopped during the study | total protein (`chem.protein`) | ~29% | measured in 2019 and 2020, partly in 2021, missing in 2022 |
+| Not measured at every visit | BMI, height | ~21% | height not measured at each visit |
+| Occasionally skipped | most lab values | ~1 to 3% | random (MCAR) |
+
+- use `cmv_status` instead of the CMV serology
+- use `chem.creatinine` instead of eGFR for kidney function
+- avoid using `chem.protein` (only measured in the first years)
+- BMI can be used: it is fairly consistent in adults over a period of 2 years
+- keep variables with about 1% missing: handle with `lm()` in part 2
+
+```{r q2-time-pattern}
+meta %>%
+  group_by(sample.drawYear) %>%
+  summarise(pct_missing_egfr    = round(mean(is.na(chem.egfr_aa)) * 100),
+            pct_missing_protein = round(mean(is.na(chem.protein)) * 100))
+```
+ 
+## Missing values in protein data
+
+1) how many values are missing in the protein file?
+
+We count the missing NPX values in total and per protein.
+
+```{r q2-npx}
+# total number of missing values and percentage of the whole matrix
+sum(is.na(npx))
+round(mean(is.na(npx)) * 100, 2)
+
+# number of missing values per protein, only proteins with missing values
+npx_missing <- colSums(is.na(npx))
+tibble(protein = names(npx_missing), 
+       n_missing = npx_missing,
+       pct_missing = round(npx_missing / nrow(npx) * 100, 1)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+```
+
+2) where are the missing values, per batch?
+
+We count the missing values per sample (instead of per protein) and link this to the Olink batch of
+each sample.
+
+```{r q2-npx-batch}
+n_proteins <- ncol(npx) - 1   # number of protein columns (minus the ID column)
+
+tibble(sample_kit_id = npx$sample_kit_id,
+       n_missing     = rowSums(is.na(npx))) %>%
+  left_join(meta %>% select(sample_kit_id, olink_batch_id), by = "sample_kit_id") %>%
+  group_by(olink_batch_id) %>%
+  summarise(n_samples      = n(),
+            missing_values = sum(n_missing)) %>%
+  mutate(pct_of_all_missing   = round(missing_values / sum(missing_values) * 100, 1),
+         pct_missing_in_batch = round(missing_values / (n_samples * n_proteins) * 100, 2))
+```
+- batch 20201752 is the batch with all the old protein names
+- missing values across all batches : the old protein names are missing in the later batches while the new protein names are missing in the first batch 
+- these are not really missing values , the same measurement is under 2 names
+- there are only 'real missing' values in two batches
+
+### Merging duplicate assays
+
+Nine proteins appear twice in the data: under an old and a new gene name, with
+the same Olink ID. The old name was only measured in batch 20201752, the new
+name in all other batches. We check that they never overlap and merge each pair
+into one column.
+
+```{r q2-duplicates}
+# which proteins share the same Olink ID?
+annot %>%
+  filter(duplicate_olink_id) %>%
+  select(protein, olink_id, n_missing) %>%
+  arrange(olink_id)
+```
+
+```{r q2-overlap}
+# check: is there any sample where both names have a value? (should all be 0)
+npx %>%
+  summarise(ADGRE5_CD97   = sum(!is.na(ADGRE5) & !is.na(CD97)),
+            CCN4_WISP1    = sum(!is.na(CCN4)   & !is.na(WISP1)),
+            CCN5_WISP2    = sum(!is.na(CCN5)   & !is.na(WISP2)),
+            CEP20_FOPNL   = sum(!is.na(CEP20)  & !is.na(FOPNL)),
+            CEP43_FGFR1OP = sum(!is.na(CEP43)  & !is.na(FGFR1OP)),
+            DARS1_DARS    = sum(!is.na(DARS1)  & !is.na(DARS)),
+            GOLM2_CASC4   = sum(!is.na(GOLM2)  & !is.na(CASC4)),
+            HARS1_HARS    = sum(!is.na(HARS1)  & !is.na(HARS)),
+            IRAG2_LRMP    = sum(!is.na(IRAG2)  & !is.na(LRMP)))
+```
+- In none of the 867 samples do both names of a pair have a value (all nine overlaps are 0). The old and the new name are therefore the same measurement under two names, and merging does not lose or overwrite any value.
+
+
+```{r q2-merge}
+# fill the empty values of the new name with the values of the old name,
+# then remove the old-name columns
+npx <- npx %>%
+  mutate(ADGRE5 = coalesce(ADGRE5, CD97),
+         CCN4   = coalesce(CCN4,   WISP1),
+         CCN5   = coalesce(CCN5,   WISP2),
+         CEP20  = coalesce(CEP20,  FOPNL),
+         CEP43  = coalesce(CEP43,  FGFR1OP),
+         DARS1  = coalesce(DARS1,  DARS),
+         GOLM2  = coalesce(GOLM2,  CASC4),
+         HARS1  = coalesce(HARS1,  HARS),
+         IRAG2  = coalesce(IRAG2,  LRMP)) %>%
+  select(-c(CD97, WISP1, WISP2, FOPNL, FGFR1OP, DARS, CASC4, HARS, LRMP))
+
+dim(npx)
+```
+- 9 proteins were present under an old and a new gene name (same Olink ID). The old name was only measured in batch 20201752, the new name in the other batches. We merged each pair into one column (filling the empty values of the new name with those of the old name) and removed the old names. The data now has 1,472 proteins (867 x 1,473 including the sample ID).
+
+
+### After merging the duplicate assays, we count the missing values again
+
+```{r q2-npx-after-merging}
+# total number of missing values and percentage of the whole matrix
+sum(is.na(npx))
+round(mean(is.na(npx)) * 100, 2)
+
+# number of missing values per protein, only proteins with missing values
+npx_missing <- colSums(is.na(npx))
+tibble(protein = names(npx_missing), 
+       n_missing = npx_missing,
+       pct_missing = round(npx_missing / nrow(npx) * 100, 1)) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+```
+- After merging, 2,683 values are missing (0.21% of the matrix), spread over 21 proteins. The apparent missing values of the duplicate assays are gone: they were the same measurement under two names.
+
+
+```{r q2-npx-batch-after-merging}
+n_proteins <- ncol(npx) - 1   # number of protein columns (minus the ID column)
+
+tibble(sample_kit_id = npx$sample_kit_id,
+       n_missing     = rowSums(is.na(npx))) %>%
+  left_join(meta %>% select(sample_kit_id, olink_batch_id), by = "sample_kit_id") %>%
+  group_by(olink_batch_id) %>%
+  summarise(n_samples      = n(),
+            missing_values = sum(n_missing)) %>%
+  mutate(pct_of_all_missing   = round(missing_values / sum(missing_values) * 100, 1),
+         pct_missing_in_batch = round(missing_values / (n_samples * n_proteins) * 100, 2))
+```
+
+- there are only 'real missing' values in two batches : 20201752 and Q-04064
+
+### Missing values per plate
+
+We check on which plates the remaining missing values occur.
+
+```{r q2-npx-plate}
+tibble(sample_kit_id = npx$sample_kit_id,
+       n_missing     = rowSums(is.na(npx))) %>%
+  left_join(meta %>% select(sample_kit_id, olink_batch_id, olink_plate_id),
+            by = "sample_kit_id") %>%
+  group_by(olink_batch_id, olink_plate_id) %>%
+  summarise(n_samples      = n(),
+            missing_values = sum(n_missing)) %>%
+  filter(missing_values > 0)
+```
+- Missing values only occur in two batches. In Q-04064, 15 proteins are missing in every sample on all 7 plates. In 20201752, proteins are missing on three plates: 6, 2 and 5 proteins per plate.
+- The gaps always cover whole plates, never single samples, so they are technical (proteins not measured or not reported on those plates) and not random.
+
+
+### Missing values per panel
+
+We check which Olink panel the 21 proteins with missing values belong to.
+
+```{r q2-npx-panel}
+proteins_with_na <- names(npx_missing)[npx_missing > 0]
+
+annot %>%
+  filter(protein %in% proteins_with_na) %>%
+  group_by(panel) %>%
+  summarise(n_proteins = n())
+```
+- The 21 proteins with missing values come from four panels: Neurology (11), Oncology (4), Cardiometabolic (3) and Inflammation (3). The 6 proteins missing in batch 20201752 are all Neurology proteins. The 15 proteins missing in Q-04064 come from four panels.
+
+
+### Decision: how to handle the 21 proteins with missing values
+
+**Decision: remove the 21 proteins with missing values** (done in Q4).
+
+Reasons:
+
+- 15 proteins are missing in all 144 samples of batch Q-04064 and 6 proteins (APP, CD177, GRN, MMP9, MPO, SERPINB1) on three plates of batch 20201752 (40 to 123 of 156 samples). The gaps are technical and clustered per batch, so they are not missing completely at random.
+- Imputing the protein median would give all samples of that batch the same value for these proteins (no information) and distorts the variance in the PCA.
+- Keeping them as NA means these proteins can only be tested in the remaining batches, where the young/older balance is different. Batch 20201752 is 76% young, so the missingness is linked to age group.
+- The loss is small: 21 of 1472 proteins (1.4%).
+
+Alternative that was considered: keep NA for statistical tests and impute the protein median for the PCA. Write down the final group choice here.
+
+```{r plates-per-batch}
+meta %>%
+  group_by(olink_batch_id) %>%
+  summarise(n_plates  = n_distinct(olink_plate_id),
+            n_samples = n())
+```
+- There are 6 batches. Five batches have 4 plates each, batch Q-04064 has 7 plates (144 samples). Batch sizes range from 92 to 197 samples.
+
+
+# Q3 : Are there samples or features that behave unlike the rest? Is that a technical error or interesting biology?
+
+## Samples
+
+For each sample we calculate the median and the spread (IQR) of all its NPX
+values. A sample with a very different median or spread may indicate a
+technical problem.
+
+```{r q3-sample-summary}
+sample_qc <- npx %>%
+  pivot_longer(-sample_kit_id, names_to = "protein", values_to = "NPX") %>%
+  group_by(sample_kit_id) %>%
+  summarise(median_npx = median(NPX, na.rm = TRUE),
+            iqr_npx    = IQR(NPX, na.rm = TRUE)) %>%
+  left_join(meta %>% select(sample_kit_id, olink_batch_id), by = "sample_kit_id")
+
+sample_qc
+```
+
+### Compare the samples by batch
+
+```{r q3-sample-boxplot}
+ggplot(sample_qc, aes(x = olink_batch_id, y = median_npx, fill = olink_batch_id)) +
+  geom_boxplot(show.legend = FALSE) +
+  labs(x = "Olink batch", y = "Median NPX per sample",
+       title = "Median NPX per sample, by batch") +
+  theme_classic()
+```
+- The median NPX per sample differs clearly between batches. Batch Q-04064 has a much lower median (about -0.1) than the other batches (about 0.25 to 0.5). This is a technical batch effect, not a difference between donors.
+- Because of this, outliers must be judged within their own batch (next step) and not against all samples together.
+
+
+### Find deviating samples within their batch
+
+To find samples that deviate within their own batch, we calculate a robust
+z-score (based on the median and MAD instead of the mean and SD) for the median
+and the IQR of each sample. Samples with |z| > 4 are flagged.
+
+```{r q3-outliers}
+sample_qc <- sample_qc %>%
+  group_by(olink_batch_id) %>%
+  mutate(z_median = (median_npx - median(median_npx)) / mad(median_npx),
+         z_iqr    = (iqr_npx    - median(iqr_npx))    / mad(iqr_npx)) %>%
+  ungroup() %>%
+  mutate(flag_outlier = abs(z_median) > 4 | abs(z_iqr) > 4)
+
+# how many samples are flagged?
+sum(sample_qc$flag_outlier)
+
+# which samples, and from which donor and visit?
+sample_qc %>%
+  filter(flag_outlier) %>%
+  left_join(meta %>% select(sample_kit_id, subject.subjectGuid, sample.visitName),
+            by = "sample_kit_id") %>%
+  arrange(olink_batch_id)
+```
+- 17 samples (2%) deviate within their own batch (robust z-score > 4 on the median or the IQR), 16 of them on a wider spread (IQR). Their percentage of proteins below the detection limit is normal, so there is no sign of failed measurements. They are spread over all batches.
+
+To judge whether the flagged samples reflect a technical problem or biology, we
+look at their visit, CRP (inflammation) and the percentage of proteins below the
+limit of detection (a failed measurement would show many proteins below LOD).
+
+```{r q3-outliers-check}
+sample_qc %>%
+  filter(flag_outlier) %>%
+  left_join(meta %>% select(sample_kit_id, subject.subjectGuid, sample.visitName,
+                            infl.hs_crp, pct_below_lod),
+            by = "sample_kit_id") %>%
+  select(sample_kit_id, subject.subjectGuid, sample.visitName, infl.hs_crp,
+         pct_below_lod, z_median, z_iqr)
+
+# for comparison: median CRP and % below LOD across all samples
+meta %>%
+  summarise(median_crp = median(infl.hs_crp, na.rm = TRUE),
+      median_pct_below_lod = median(pct_below_lod))
+```
+
+**Interpretation:** 17 samples (2%) deviate strongly within their batch, 16 of them
+because of a wider spread of NPX values (IQR) rather than a different level.
+They show no signs of a failed measurement: their percentage of proteins below
+the limit of detection is similar to the other samples. Their CRP is generally
+normal, except for one sample (KT02000, CRP 7.9), which may reflect an infection
+at that time. None are day-7 post-vaccination samples. Two donors (BR1032,
+BR2016) are flagged twice, which suggests a donor-specific protein profile.
+
+**Decision:** because there is no clear evidence of a technical error, we keep
+all samples. We check in the PCA (question 5) that they do not dominate the
+results.
+
+## Features (proteins)
+
+We look at the spread of each protein (after merging the duplicate assays, before any filtering). The matrix still contains the NA's of Q2, so we use `na.rm = TRUE`.
+
+```{r q3-feature-setup}
+mat_all <- npx %>% column_to_rownames("sample_kit_id") %>% as.matrix()
+stopifnot(identical(rownames(mat_all), meta$sample_kit_id))
+
+protein_qc <- tibble(protein    = colnames(mat_all),
+                     npx_median = apply(mat_all, 2, median, na.rm = TRUE),
+                     npx_sd     = apply(mat_all, 2, sd,     na.rm = TRUE),
+                     npx_min    = apply(mat_all, 2, min,    na.rm = TRUE),
+                     npx_max    = apply(mat_all, 2, max,    na.rm = TRUE))
+
+protein_qc %>% arrange(desc(npx_sd)) %>% head(10)    # largest spread
+protein_qc %>% arrange(npx_min) %>% head(10)         # lowest values
+protein_qc %>% arrange(desc(npx_max)) %>% head(10)   # highest values
+```
+- A few proteins have a very large spread across samples (e.g. PNLIPRP2, IL5, IL10, GH1, PM20D1; sd 2.5 to 3.8 NPX). Some of them (IL5, IL10) have a strongly negative median, so most samples have very low values and a few are high. Negative NPX values are normal on a log2 scale.
+- A large spread can be technical or biological. We check next how much of it is explained by batch.
+
+
+To judge whether a large spread is technical or biological, we calculate for each protein how much of its variance is explained by batch (R-squared of a linear model with batch as predictor).
+
+```{r q3-feature-batch-r2}
+r2_batch <- map_dbl(colnames(mat_all),
+                    ~ summary(lm(mat_all[, .x] ~ meta$olink_batch_id))$r.squared)
+
+protein_qc <- protein_qc %>% mutate(r2_batch = r2_batch)
+
+ggplot(protein_qc, aes(r2_batch)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(x = "Variance explained by batch (R-squared)", y = "Number of proteins",
+       title = "How much of each protein's variance is batch?") +
+  theme_classic()
+
+c(median = median(r2_batch), n_above_0.3 = sum(r2_batch > 0.3), n_above_0.5 = sum(r2_batch > 0.5))
+protein_qc %>% arrange(desc(r2_batch)) %>% head(10)
+```
+- Batch explains a large part of the variance of many proteins: median R-squared 0.23, 552 proteins above 0.3 and 171 above 0.5 (e.g. DPEP2 0.97, MMP7 0.93, LTA4H 0.93, IL10 0.92).
+- So the large spread of many proteins is technical (batch) and not biology. This is why we need to account for batch later (Q5 and part 2).
+
+
+```{r q3-feature-extremes, fig.height=6}
+# the 6 proteins with the largest spread, per batch
+extreme <- protein_qc %>% arrange(desc(npx_sd)) %>% head(6) %>% pull(protein)
+
+as_tibble(mat_all[, extreme], rownames = "sample_kit_id") %>%
+  pivot_longer(-sample_kit_id, names_to = "protein", values_to = "NPX") %>%
+  left_join(meta %>% select(sample_kit_id, olink_batch_id), by = "sample_kit_id") %>%
+  ggplot(aes(x = olink_batch_id, y = NPX)) +
+  geom_boxplot(outlier.size = 0.5) +
+  facet_wrap(~ protein, scales = "free_y") +
+  labs(x = "Olink batch", y = "NPX") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r q3-pnliprp2}
+# is the low state of PNLIPRP2 (NPX < -3) a stable property of a donor?
+tibble(donor = meta$subject.subjectGuid, low = mat_all[, "PNLIPRP2"] < -3) %>%
+  group_by(donor) %>%
+  summarise(frac_low = mean(low)) %>%
+  count(frac_low)                                    # expected: 0 -> 68 donors, 1 -> 28 donors
+```
+- IL10 and IL5 are about 6 to 7 NPX lower in batches 20201752, 20211036 and 20211037 than in the other three batches, with a small spread within each batch. This is a technical batch effect.
+- GH1, PM20D1 and PMVK show both a shift between batches and a wide spread within each batch (partly real differences between donors).
+- PNLIPRP2 has the same two-level pattern in every batch (many samples around -7, the others around 0). In our data this is fully donor-specific (28 donors low in all their samples, 68 donors in none), so it is not a batch effect but a stable difference between donors.
+
+
+**Decision:** we do not remove proteins on their minimum or maximum alone. The batch effect is handled in Q5 and as a covariate in part 2.
+
+## Metadata
+
+```{r q3-meta-donor}
+# are sex and CMV status constant within a donor? (expected: 96 donors with 1 and 1)
+meta %>%
+  group_by(subject.subjectGuid) %>%
+  summarise(n_sex = n_distinct(subject.biologicalSex),
+            n_cmv = n_distinct(cmv_status)) %>%
+  count(n_sex, n_cmv)
+
+# batch versus age group
+table(meta$olink_batch_id, meta$subject.ageGroup)
+
+# CMV status per age group (% of samples)
+meta %>%
+  count(subject.ageGroup, cmv_status) %>%
+  group_by(subject.ageGroup) %>%
+  mutate(pct = round(n / sum(n) * 100))
+```
+- Sex and CMV status are constant within every donor (96 donors).
+- Batch and age group are partly confounded: batch 20201752 has 76% young samples (119 of 156), while the other batches have more older samples (up to about 65% in Q-02017). Every batch contains both age groups, so a correction for batch is still possible.
+- CMV status is linked to age group: 54% of the samples of older adults are CMV-positive versus 35% in young adults. Take this into account when interpreting an age effect.
+
+
+```{r q3-meta-age}
+ggplot(meta, aes(sample.subjectAgeAtDraw)) +
+  geom_histogram(binwidth = 2, fill = "grey70", color = "white") +
+  labs(x = "Age at blood draw (years)", y = "Number of samples") +
+  theme_classic()
+```
+
+# Q4 : Are there pre-processing steps needed on the data (normalization, log-transformation, standardization, filtering, etc)?
+
+| Step | What | Why |
+|---|---|---|
+| Log-transformation | not needed | NPX is already on a log2 scale |
+| Normalization | none by us | NPX is an Olink-normalised unit, but the batches are not bridged, so a batch effect remains (see Q5) |
+| Merge duplicate assays | done in Q2 (9 pairs) | each protein must count only once |
+| Remove proteins with NA | 21 proteins | technical, per-batch gaps (see Q2) |
+| Remove technical replicates | CXCL8, IL6, TNF (4 panels each): keep 1 | the same protein must count only once |
+| Filter on detection limit | remove proteins with > 50% of values below LOD | such proteins mostly measure noise; no group labels are used |
+| Standardization | only inside the PCA (`scale. = TRUE`) | otherwise proteins with a large spread dominate the PCA. The saved data are not standardized |
+| Batch correction | `removeBatchEffect` for exploration (Q5) | see Q5 for the risks |
+
+**Remove the proteins with missing values**
+
+```{r q4-na}
+na_per_protein <- colSums(is.na(npx))
+proteins_na <- names(na_per_protein)[na_per_protein > 0]
+length(proteins_na)                                  # expected: 21
+
+npx_f <- npx %>% select(-all_of(proteins_na))
+n_after_na <- ncol(npx_f) - 1
+n_after_na                                           # expected: 1451
+```
+- The 21 proteins with missing values were removed (1,472 -> 1,451 proteins). The gaps are technical and cover whole plates (see Q2), so they cannot be imputed reliably. Because batch 20201752 is mostly young, imputing or testing on the remaining batches would also bias the comparison between age groups. The loss is small (1.4%).
+
+
+**Technical replicates of CXCL8, IL6 and TNF**
+
+Each of these three proteins is measured in four panels. For each protein we keep the replicate with the lowest percentage of values below the detection limit (ties: the first in alphabetical order).
+
+```{r q4-replicates}
+replicates <- annot %>%
+  filter(protein %in% colnames(npx_f)) %>%
+  group_by(assay) %>%
+  filter(n() > 1) %>%
+  arrange(assay, pct_below_lod, protein) %>%
+  mutate(keep = row_number() == 1) %>%
+  ungroup() %>%
+  select(assay, protein, pct_below_lod, keep)
+
+print(replicates, n = Inf)
+stopifnot(sum(!replicates$keep) == 9)               # 3 proteins x 3 removed replicates
+
+npx_f <- npx_f %>% select(-all_of(replicates$protein[!replicates$keep]))
+n_after_rep <- ncol(npx_f) - 1
+n_after_rep                                          # expected: 1442
+```
+- CXCL8, IL6 and TNF were each measured in four panels (technical replicates of the same protein). For each protein we keep the replicate with the lowest percentage of values below the detection limit (ties: first in alphabetical order) and remove the other three, so each protein counts only once. Result: 1,451 -> 1,442 proteins.
+- Kept: IL6_OID20911 (0.3%), TNF_OID20848 (0.1%) and CXCL8_OID20153 (all four replicates have 0.0%, so this is an arbitrary choice).
+
+
+**Filter on the detection limit (LOD)**
+
+The threshold of 50% is our choice. We first look at how many proteins different thresholds would remove.
+
+```{r q4-lod-sensitivity}
+annot %>%
+  filter(protein %in% colnames(npx_f)) %>%
+  summarise(above_20_pct = sum(pct_below_lod > 20),
+            above_50_pct = sum(pct_below_lod > 50),
+            above_80_pct = sum(pct_below_lod > 80))
+```
+- Number of proteins that would be removed at different thresholds (percentage of values below the detection limit): above 20%: 250, above 50%: 148, above 80%: 47.
+- A strict threshold (20%) removes many proteins that are measurable in part of the samples. A loose threshold (80%) keeps proteins that mostly measure noise. We chose 50%.
+
+
+```{r q4-lod}
+lod_threshold <- 50
+
+proteins_lod <- annot %>%
+  filter(protein %in% colnames(npx_f), pct_below_lod > lod_threshold) %>%
+  pull(protein)
+length(proteins_lod)                                 # expected: 148
+
+npx_f <- npx_f %>% select(-all_of(proteins_lod))
+n_after_lod <- ncol(npx_f) - 1
+n_after_lod                                          # expected: 1294
+```
+- We removed the 148 proteins with more than 50% of their values below the detection limit (1,442 -> 1,294 proteins). Such proteins mostly measure noise. The filter is only based on the detection limit, never on age group, so no labels are used in the preprocessing.
+
+
+```{r q4-overview}
+tibble(step = c("Raw data",
+                "After merging duplicate assays",
+                "After removing proteins with NA",
+                "After removing technical replicates",
+                "After LOD filter (> 50% below LOD)"),
+       n_proteins = c(nrow(annot), ncol(npx) - 1, n_after_na, n_after_rep, n_after_lod))
+```
+- Overview of the protein filtering: 1,481 raw -> 1,472 after merging duplicate assays -> 1,451 after removing proteins with NA -> 1,442 after removing technical replicates -> 1,294 after the detection-limit filter.
+
+
+**Decision:** we keep a threshold of 50% (a stricter threshold of 20% would remove many more proteins, a looser one of 80% keeps too much noise). We filter only on the detection limit and never on age group, so no labels are used in the preprocessing.
+
+# Q5 : Do samples cluster by the biology you care about, or by a technical factor?
+
+We make a PCA of all samples on the 1294 remaining proteins (scaled), before and after correcting for batch. The correction removes batch but protects the age group in the model design.
+
+```{r q5-setup, message=FALSE}
+# limma is a Bioconductor package. Install it once in the console with:
+# if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install("limma")
+library(limma)
+
+mat <- npx_f %>% column_to_rownames("sample_kit_id") %>% as.matrix()
+stopifnot(!anyNA(mat))
+
+meta_s <- meta[match(rownames(mat), meta$sample_kit_id), ]
+stopifnot(identical(meta_s$sample_kit_id, rownames(mat)))
+
+dir.create("figures", showWarnings = FALSE)
+dir.create("results", showWarnings = FALSE)
+```
+
+```{r q5-functions}
+run_pca <- function(m) {
+  p <- prcomp(m, scale. = TRUE)
+  list(scores = as_tibble(p$x[, 1:5], rownames = "sample_kit_id") %>%
+         left_join(meta_s %>% select(sample_kit_id, olink_batch_id, subject.subjectGuid,
+                                     subject.ageGroup, cmv_status),
+                   by = "sample_kit_id") %>%
+         left_join(sample_qc %>% select(sample_kit_id, flag_outlier), by = "sample_kit_id"),
+       var_pct = round(100 * p$sdev^2 / sum(p$sdev^2), 1))
+}
+
+plot_pca <- function(res, title) {
+  ggplot(res$scores, aes(PC1, PC2, color = olink_batch_id, shape = subject.ageGroup)) +
+    geom_point(size = 1.5) +
+    labs(title = title,
+         x = paste0("PC1 (", res$var_pct[1], "%)"),
+         y = paste0("PC2 (", res$var_pct[2], "%)"),
+         color = "Batch", shape = "Age group") +
+    theme_classic()
+}
+
+# how much of each PC is explained by batch, age group and donor (adjusted R-squared)?
+pc_r2 <- function(res) {
+  map_dfr(1:5, function(i) {
+    y <- res$scores[[paste0("PC", i)]]
+    tibble(PC        = paste0("PC", i),
+           var_pct   = res$var_pct[i],
+           batch     = summary(lm(y ~ res$scores$olink_batch_id))$adj.r.squared,
+           age_group = summary(lm(y ~ res$scores$subject.ageGroup))$adj.r.squared,
+           donor     = summary(lm(y ~ res$scores$subject.subjectGuid))$adj.r.squared)
+  }) %>%
+    mutate(across(batch:donor, ~ round(.x, 2)))
+}
+```
+
+## Before batch correction
+
+```{r q5-before}
+pca_before <- run_pca(mat)
+
+p_before <- plot_pca(pca_before, "Before batch correction")
+p_before
+ggsave("figures/pca_before_batch_correction.png", p_before, width = 16, height = 11, units = "cm")
+
+pc_r2(pca_before)
+```
+- Before correction the samples cluster by batch: PC1 (25.7% of the variance) separates batch Q-04064 from the rest and PC2 (9.0%) separates Q-02017 and 20212223 from the other batches.
+- Batch explains about 67% (PC1) and 69% (PC2) of the variance of these components (adjusted R-squared), age group only 1% and 13%. So the strongest structure in the data is technical.
+- Donor explains 72% of PC4 and 85% of PC5: samples of the same donor are very similar (repeated measures).
+
+
+## After batch correction
+
+```{r q5-after}
+design  <- model.matrix(~ subject.ageGroup, data = meta_s)
+mat_cor <- t(removeBatchEffect(t(mat), batch = meta_s$olink_batch_id, design = design))
+
+pca_after <- run_pca(mat_cor)
+
+p_after <- plot_pca(pca_after, "After batch correction")
+p_after
+ggsave("figures/pca_after_batch_correction.png", p_after, width = 16, height = 11, units = "cm")
+
+pc_r2(pca_after)
+```
+- The 17 samples flagged in Q3 do not form a separate cluster, but they lie at the edge of PC1 (the right side), because their values have a wider spread. Repeating the PCA without them changes little: PC1 drops from 16.6% to about 15.5% and the age signal on PC2 and PC5 stays the same. We therefore keep them in the analysis.
+
+- After correcting for batch (with age group protected in the model design), the six batches are mixed. Batch explains about 0% of every PC and PC1 drops from 25.7% to 16.6%.
+- Age group now explains 31% of PC2 and 28% of PC5, so part of the structure is biological. Donor explains 38% of PC1 and 67 to 86% of PC2 to PC5: the repeated measures of the same donor dominate the structure of the data.
+
+
+## Do the flagged samples dominate the PCA?
+
+```{r q5-flagged}
+ggplot(pca_after$scores, aes(PC1, PC2, color = flag_outlier)) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = c("grey70", "red")) +
+  labs(title = "Samples flagged in Q3 (after batch correction)", color = "Flagged") +
+  theme_classic()
+```
+
+```{r q5-sensitivity}
+# PCA again without the 17 flagged samples
+keep <- !pca_after$scores$flag_outlier
+pca_k <- prcomp(mat_cor[keep, ], scale. = TRUE)
+round(100 * pca_k$sdev[1:5]^2 / sum(pca_k$sdev^2), 1)
+age_k <- meta_s$subject.ageGroup[keep]
+sapply(1:5, function(i) round(summary(lm(pca_k$x[, i] ~ age_k))$adj.r.squared, 2))
+```
+- Sensitivity check without the 17 flagged samples: PC1 15.6% (was 16.6%), PC2 8.7% (was 9.0%), age group explains 0.29 of PC2 and 0.30 of PC5 (was 0.31 and 0.28). The conclusions do not change.
+
+
+
+
+**Conclusion Q5:**
+
+- Before correction the samples cluster by a technical factor (batch), not by age group.
+- After correction the batches are mixed and part of the structure is biological (age group explains part of PC2 and PC5). Donor explains most of PC2 to PC5.
+- The 17 samples flagged in Q3 lie at the edge of PC1 but do not change the conclusions (see the sensitivity check).
+- Risks: batch and age group are partly confounded (batch 20201752 is 76% young), so a strong correction can reduce a real age effect. The correction also uses the label `subject.ageGroup`, which can leak information in a classifier (part 4). We therefore keep both the corrected and the uncorrected data.
+
+```{r q5-save}
+write_csv(as_tibble(mat,     rownames = "sample_kit_id"), "results/olink_filtered.csv")
+write_csv(as_tibble(mat_cor, rownames = "sample_kit_id"), "results/olink_filtered_batchcorrected.csv")
+dim(mat); dim(mat_cor)                               # expected: 867 x 1294 (both)
+```
+
+# Q6 : Is the preprocessed dataset suitable for the types of questions you want to answer in the next parts?
+
+Yes, with the following points of attention:
+
+1. **Repeated measures:** 96 donors, 867 samples. Donor explains most of the variance in PC2 to PC5. Samples of the same donor are not independent, so use donor as a random effect or an appropriate model in part 2, and split train and test **per donor** in part 4.
+2. **Batch:** use batch as a covariate in the models of part 2 instead of testing on pre-corrected data. In part 4 be careful with the corrected data (label leakage), for example by estimating the correction on the training data only.
+3. **Age:** age consists of two separate groups, so use a binary outcome (young versus older) and draw no conclusions about ages between about 37 and 53.
+4. **CMV status** is linked to age group (about 54% versus 35% CMV-positive), so take it into account when interpreting an age effect.
+5. **Scaling:** the saved data are not standardized. Standardize per method where needed, and in part 4 only on the training data.
+6. **Lost proteins:** 187 of the 1481 proteins were removed in total (9 merged duplicates, 21 with NA, 9 replicates, 148 below the detection limit). Check that proteins that matter for your hypothesis are still in the data.
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
